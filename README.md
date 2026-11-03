@@ -63,6 +63,22 @@ Run tests with `python -m pytest -q`.
 * SQLite storage; every tournament's data is isolated by `tournament_id`. Databases from v1 are migrated
   in place on startup (bracket games can have undecided teams).
 
+## Releasing
+
+CourtPlan uses [Semantic Versioning](https://semver.org/). The version lives in `VERSION`; the
+API reports it at `GET /api/version` (and in `/api/docs`), and the app shows it in the footer.
+
+1. As changes merge, add a line under `## [Unreleased]` in `CHANGELOG.md`.
+2. Cut the release: `python scripts/release.py minor` (or `patch`, `major`, or `X.Y.Z`). This bumps
+   `VERSION` and dates the Unreleased section.
+3. Commit, tag and push: `git commit -am "Release vX.Y.Z" && git tag -a vX.Y.Z -m "CourtPlan vX.Y.Z" && git push origin HEAD vX.Y.Z`.
+
+Pushing the tag runs `.github/workflows/release.yml`: it checks the tag matches `VERSION`, runs
+the tests, and publishes a GitHub release with that version's changelog notes.
+
+Bump `major` for changes that break existing data or API clients, `minor` for new features,
+and `patch` for fixes.
+
 ## Not built yet
 
 Double elimination and consolation brackets, touch drag and drop on phones, SMS delivery (e.g. Twilio) for alerts, registration/payments,
