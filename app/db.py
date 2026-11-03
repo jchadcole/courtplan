@@ -4,6 +4,22 @@ import threading
 
 DB_PATH = os.environ.get("TOURNEY_DB", os.path.join(os.path.dirname(__file__), "..", "data", "tourney.db"))
 
+GAMES_DDL = """CREATE TABLE IF NOT EXISTS {name} (
+  id INTEGER PRIMARY KEY, tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  key TEXT NOT NULL, division_id INTEGER REFERENCES divisions(id) ON DELETE CASCADE,
+  pool TEXT, round INTEGER, team_a INTEGER REFERENCES teams(id) ON DELETE CASCADE,
+  team_b INTEGER REFERENCES teams(id) ON DELETE CASCADE,
+  court_id INTEGER REFERENCES courts(id) ON DELETE SET NULL,
+  start_at TEXT, end_at TEXT, original_start_at TEXT,
+  ref_crew_id INTEGER REFERENCES ref_crews(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'scheduled'
+    CHECK (status IN ('scheduled','in_progress','final','unscheduled')),
+  score_a INTEGER, score_b INTEGER, flags TEXT DEFAULT '',
+  bracket_id INTEGER REFERENCES brackets(id) ON DELETE CASCADE,
+  src_a TEXT, src_b TEXT, locked INTEGER NOT NULL DEFAULT 0, allow TEXT NOT NULL DEFAULT '',
+  UNIQUE (tournament_id, key)
+);"""
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
@@ -71,23 +87,18 @@ CREATE TABLE IF NOT EXISTS preferences (
   day TEXT, start TEXT, "end" TEXT, venue_id INTEGER REFERENCES venues(id) ON DELETE CASCADE,
   hard INTEGER NOT NULL DEFAULT 0, note TEXT DEFAULT '', source TEXT NOT NULL DEFAULT 'manual'
 );
+CREATE TABLE IF NOT EXISTS brackets (
+  id INTEGER PRIMARY KEY, tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
+  division_id INTEGER NOT NULL REFERENCES divisions(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, size INTEGER NOT NULL, seeding TEXT NOT NULL DEFAULT 'pool',
+  third_place INTEGER NOT NULL DEFAULT 0, seeds TEXT, status TEXT NOT NULL DEFAULT 'waiting',
+  note TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS ref_crews (
   id INTEGER PRIMARY KEY, tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
   name TEXT NOT NULL, venue_id INTEGER REFERENCES venues(id) ON DELETE SET NULL
 );
-CREATE TABLE IF NOT EXISTS games (
-  id INTEGER PRIMARY KEY, tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
-  key TEXT NOT NULL, division_id INTEGER REFERENCES divisions(id) ON DELETE CASCADE,
-  pool TEXT, round INTEGER, team_a INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-  team_b INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-  court_id INTEGER REFERENCES courts(id) ON DELETE SET NULL,
-  start_at TEXT, end_at TEXT, original_start_at TEXT,
-  ref_crew_id INTEGER REFERENCES ref_crews(id) ON DELETE SET NULL,
-  status TEXT NOT NULL DEFAULT 'scheduled'
-    CHECK (status IN ('scheduled','in_progress','final','unscheduled')),
-  score_a INTEGER, score_b INTEGER, flags TEXT DEFAULT '',
-  UNIQUE (tournament_id, key)
-);
+{GAMES}
 CREATE INDEX IF NOT EXISTS games_t ON games(tournament_id, start_at);
 CREATE TABLE IF NOT EXISTS schedule_runs (
   id INTEGER PRIMARY KEY, tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,
@@ -103,7 +114,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY, tournament_id INTEGER, user_id INTEGER, action TEXT NOT NULL,
   detail TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-"""
+""".replace("{GAMES}", GAMES_DDL.replace("{name}", "games"))
 
 _local = threading.local()
 
@@ -121,8 +132,27 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 def init(path: str | None = None):
     conn = connect(path)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate(conn):
+    """Bring databases created by v1 up to date (bracket games have no teams until seeded)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(games)")}
+    if "bracket_id" in cols:
+        return
+    old = [c for c in ("id", "tournament_id", "key", "division_id", "pool", "round", "team_a", "team_b",
+                       "court_id", "start_at", "end_at", "original_start_at", "ref_crew_id", "status", "score_a",
+                       "score_b", "flags") if c in cols]
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript(
+        "BEGIN;" + GAMES_DDL.replace("{name}", "games_new") +
+        f"INSERT INTO games_new({','.join(old)}) SELECT {','.join(old)} FROM games;"
+        "DROP TABLE games; ALTER TABLE games_new RENAME TO games;"
+        "CREATE INDEX IF NOT EXISTS games_t ON games(tournament_id, start_at); COMMIT;")
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 def rows(cur) -> list:
