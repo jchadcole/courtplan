@@ -6,6 +6,8 @@ All notable changes to CourtPlan are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-03
+
 ### Added
 - Single-elimination brackets from pool standings (Brackets tab, public bracket view) and a
   drag-and-drop schedule grid with game locks, conflict waivers and re-optimize (PR #2).
@@ -28,5 +30,6 @@ First version (PR #1).
   and tie-breakers, CSV import and export.
 - Secure access: scrypt passwords, server-side sessions, CSRF tokens, login throttling, role checks.
 
-[Unreleased]: https://github.com/jchadcole/courtplan/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jchadcole/courtplan/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jchadcole/courtplan/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jchadcole/courtplan/releases/tag/v1.0.0
