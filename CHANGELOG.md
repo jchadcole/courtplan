@@ -7,6 +7,8 @@ All notable changes to CourtPlan are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- Single-elimination brackets from pool standings (Brackets tab, public bracket view) and a
+  drag-and-drop schedule grid with game locks, conflict waivers and re-optimize (PR #2).
 - Release versioning: `VERSION` file, this changelog, `scripts/release.py`, a tag-triggered
   GitHub release workflow, `GET /api/version`, and the version shown in the app footer.
 

@@ -133,19 +133,22 @@ class Game:
     division_id: int
     pool: str
     round: int
-    team_a: int
-    team_b: int
+    team_a: Optional[int]  # None for a bracket slot that isn't decided yet
+    team_b: Optional[int]
+    after: tuple = ()  # keys of games that must finish (plus rest) before this one starts
+    phase: int = 0  # 0 = pool play, 1 = bracket play
 
 
 @dataclass
 class Fixed:
     """A game whose time/court is locked (already played, in progress, or kept during repair)."""
     key: str
-    team_a: int
-    team_b: int
+    team_a: Optional[int]
+    team_b: Optional[int]
     court_id: int
     start: int
     end: int
+    after: tuple = ()
 
 
 @dataclass
@@ -295,6 +298,12 @@ class Scheduler:
         self.gmap = {g.key: g for g in self.games}
         self.not_before = not_before
         self.coach_gaps = {k: v for k, v in (coach_gaps or {}).items() if v}
+        # bracket ordering: a game can't start until its feeder games (and pool play) are over
+        self.pred, self.succ = {}, {}
+        for g in list(self.games) + list(self.fixed):
+            for p in g.after:
+                self.pred.setdefault(g.key, []).append(p)
+                self.succ.setdefault(p, []).append(g.key)
 
         self.coach_teams = {}
         for t in teams:
@@ -322,7 +331,8 @@ class Scheduler:
             c = self.courts.get(f.court_id)
             self.iv[f.key] = (f.start, f.end, c.venue_id if c else None, f.court_id)
             for t in (f.team_a, f.team_b):
-                self.team_keys.setdefault(t, set()).add(f.key)
+                if t is not None:
+                    self.team_keys.setdefault(t, set()).add(f.key)
         self.fixed_teams = {f.key: (f.team_a, f.team_b) for f in self.fixed}
         self.slot_of = {}  # key -> slot idx
         self.owner = {}  # slot idx -> key
@@ -408,7 +418,17 @@ class Scheduler:
             return False
         me = (sl.start, sl.end)
         day = sl.start // DAY
+        for p in self.pred.get(g.key, ()):
+            o = self.iv.get(p)
+            if o and sl.start < o[1] + self._order_gap(o[2], sl.venue_id):
+                return False
+        for q in self.succ.get(g.key, ()):
+            o = self.iv.get(q)
+            if o and o[0] < sl.end + self._order_gap(sl.venue_id, o[2]):
+                return False
         for t in (g.team_a, g.team_b):
+            if t is None:
+                continue
             per_day = 0
             for k in self.team_keys.get(t, ()):
                 if k == g.key:
@@ -430,6 +450,8 @@ class Scheduler:
         # multi-team coach trap
         playing = {g.team_a, g.team_b}
         for t in (g.team_a, g.team_b):
+            if t not in self.teams:
+                continue
             coach = self.teams[t].coach_id
             if coach is None:
                 continue
@@ -446,6 +468,12 @@ class Scheduler:
                     if gap < need:
                         return False
         return True
+
+    def _order_gap(self, v1, v2):
+        need = self.s.min_rest_minutes
+        if v1 is not None and v2 is not None and v1 != v2:
+            need = max(need, self.s.travel_buffer_minutes)
+        return need
 
     # ---- costs ----
     def game_cost(self, g: Game, sl: Slot) -> float:
@@ -479,7 +507,9 @@ class Scheduler:
             return sl.start < en and st < sl.end
         return False
 
-    def team_cost(self, t: int) -> float:
+    def team_cost(self, t) -> float:
+        if t is None:
+            return 0.0
         ivs = sorted(self.iv[k] for k in self.team_keys.get(t, ()))
         c = 0.0
         for a, b in zip(ivs, ivs[1:]):
@@ -502,8 +532,9 @@ class Scheduler:
         self.slot_of[g.key] = sl.idx
         self.owner[sl.idx] = g.key
         self.iv[g.key] = (sl.start, sl.end, sl.venue_id, sl.court_id)
-        self.team_keys[g.team_a].add(g.key)
-        self.team_keys[g.team_b].add(g.key)
+        for t in (g.team_a, g.team_b):
+            if t is not None:
+                self.team_keys.setdefault(t, set()).add(g.key)
 
     def unassign(self, g: Game):
         i = self.slot_of.pop(g.key, None)
@@ -511,8 +542,9 @@ class Scheduler:
             return None
         del self.owner[i]
         del self.iv[g.key]
-        self.team_keys[g.team_a].discard(g.key)
-        self.team_keys[g.team_b].discard(g.key)
+        for t in (g.team_a, g.team_b):
+            if t is not None:
+                self.team_keys[t].discard(g.key)
         return self.slots[i]
 
     def reset(self):
@@ -523,6 +555,8 @@ class Scheduler:
     def _tightness(self, g: Game) -> float:
         x = 0.0
         for t in (g.team_a, g.team_b):
+            if t not in self.teams:
+                continue
             x += len(self.hard_windows.get(t, ())) * 2
             coach = self.teams[t].coach_id
             if coach is not None:
@@ -530,12 +564,12 @@ class Scheduler:
         return x
 
     def construct(self, noise: float):
-        order = sorted(self.games, key=lambda g: (g.round, -self._tightness(g) + self.rng.random() * noise))
+        order = sorted(self.games, key=lambda g: (g.phase, g.round, -self._tightness(g) + self.rng.random() * noise))
         unplaced = []
         for g in order:
             best, best_c = None, math.inf
             ta, tb = g.team_a, g.team_b
-            base_t = self.team_cost(ta) + self.team_cost(tb)
+            base_t = self.team_cost(ta) + self.team_cost(tb)  # team_cost(None) is 0
             for sl in self.slots:
                 if sl.idx in self.owner or not self.feasible(g, sl):
                     continue
@@ -609,7 +643,7 @@ class Scheduler:
                 continue
             other_key = self.owner.get(sl.idx)
             h = self.gmap[other_key] if other_key else None
-            affected = {g.team_a, g.team_b} | ({h.team_a, h.team_b} if h else set())
+            affected = ({g.team_a, g.team_b} | ({h.team_a, h.team_b} if h else set())) - {None}
             before = sum(self.team_cost(t) for t in affected)
             gs = self.slots[self.slot_of[g.key]]
             before += self.game_cost(g, gs) + (self.game_cost(h, sl) if h else 0)
@@ -761,24 +795,51 @@ class Scheduler:
 # --------------------------------------------------------------------------
 
 def validate(s: Settings, venues, courts, teams, divisions, games, hard_windows=None,
-             soft_prefs=None, home=None, coach_gaps=None) -> list:
-    """games: list of dicts with key, team_a, team_b, start, end, venue_id, court_id."""
+             soft_prefs=None, home=None, coach_gaps=None, deps=None) -> list:
+    """games: list of dicts with key, team_a, team_b, start, end, venue_id, court_id, and optionally
+    allow (rule types the director waived for that game).
+
+    deps: key -> keys of games that must finish (plus rest) before it starts (bracket order)."""
     hard_windows = hard_windows or {}
     soft_prefs = soft_prefs or {}
     home = home or {}
     coach_gaps = coach_gaps or {}
+    deps = deps or {}
     issues = []
     tname = lambda t: teams[t].name if t in teams else str(t)
+    allow = {g["key"]: set(g.get("allow") or ()) for g in games}
 
     def add(sev, kind, keys, msg):
-        issues.append(dict(severity=sev, type=kind, games=list(keys), message=msg))
+        keys = list(keys)
+        if sev == "hard" and any(kind in allow.get(k, ()) for k in keys):
+            issues.append(dict(severity="soft", type="waived", games=keys, message=f"Allowed on purpose: {msg}"))
+            return
+        issues.append(dict(severity=sev, type=kind, games=keys, message=msg))
 
     by_court = {}
     by_team = {}
+    by_key = {}
     for g in games:
+        by_key[g["key"]] = g
         by_court.setdefault(g["court_id"], []).append(g)
         for t in (g["team_a"], g["team_b"]):
-            by_team.setdefault(t, []).append(g)
+            if t is not None:
+                by_team.setdefault(t, []).append(g)
+
+    for k, preds in deps.items():
+        g = by_key.get(k)
+        if not g:
+            continue
+        late = [by_key[p] for p in preds if p in by_key and by_key[p]["start"] >= 0]
+        for p in late:
+            need = s.min_rest_minutes
+            if p["venue_id"] != g["venue_id"]:
+                need = max(need, s.travel_buffer_minutes)
+            if g["start"] < p["end"] + need:
+                add("hard", "bracket_order", [p["key"], k],
+                    f"Bracket game at {s.abs_to_iso(g['start'])} starts before a game that feeds it is over "
+                    f"(needs {need} min after {s.abs_to_iso(p['end'])})")
+                break
 
     for cid, gs in by_court.items():
         gs.sort(key=lambda g: g["start"])
@@ -839,6 +900,8 @@ def validate(s: Settings, venues, courts, teams, divisions, games, hard_windows=
 
     for g in games:
         for t in (g["team_a"], g["team_b"]):
+            if t is None:
+                continue
             for p in soft_prefs.get(t, ()):
                 fake = Slot(0, g["court_id"], g["venue_id"], g["start"], g["end"], False)
                 if Scheduler._violates_soft(_SoftCtx(s), p, fake):
@@ -863,6 +926,8 @@ def standings(games: list) -> dict:
     table = {}
     h2h = {}
     for g in games:
+        if g.get("bracket_id") or not g.get("pool"):
+            continue
         key = (g["division"], g["pool"])
         pool = table.setdefault(key, {})
         for tid, name in ((g["team_a"], g["team_a_name"]), (g["team_b"], g["team_b_name"])):

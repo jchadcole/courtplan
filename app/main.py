@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import __version__, ai, auth, db, engine
+from . import __version__, ai, auth, brackets, db, engine
 from .events import broker
 
 STATIC = os.path.join(os.path.dirname(__file__), "..", "static")
@@ -768,7 +768,8 @@ def _game_dicts(s, rows, courts):
         out.append(dict(key=g["key"], id=g["id"], team_a=g["team_a"], team_b=g["team_b"],
                         start=s.iso_to_abs(g["start_at"]), end=s.iso_to_abs(g["end_at"]),
                         court_id=g["court_id"], venue_id=courts[g["court_id"]].venue_id,
-                        division_id=g["division_id"], ref_crew_id=g["ref_crew_id"]))
+                        division_id=g["division_id"], ref_crew_id=g["ref_crew_id"],
+                        allow=[a for a in (g.get("allow") or "").split(",") if a]))
     return out
 
 
@@ -779,7 +780,7 @@ def current_issues(c: Ctx, tid: int):
     gd = _game_dicts(s, rows, sch.courts)
     issues = engine.validate(s, sch.venues, sch.courts, sch.teams, sch.divisions, gd, sch.hard_windows,
                              sch.soft_prefs, {d.id: d.home_venue_id for d in divs if d.home_venue_id} or sch.home,
-                             sch.coach_gaps)
+                             sch.coach_gaps, deps=brackets.deps_from_rows(rows))
     return issues, rows, s
 
 
@@ -809,21 +810,32 @@ def generate(tid: int, body: GenerateIn, c: Ctx = Depends(get_ctx)):
     if c.conn.execute("SELECT 1 FROM games WHERE tournament_id=? AND status IN ('final','in_progress')",
                       (tid,)).fetchone():
         raise HTTPException(409, "Games are already underway. Use 'Repair conflicts' instead of regenerating.")
-    sch = engine.Scheduler(s, venues, courts, divs, teams, prefs, crews, seed=body.seed, coach_gaps=s.coach_gaps)
+    games = engine.generate_games(divs, teams)
+    src = {}
+    for b in db.rows(c.conn.execute("SELECT * FROM brackets WHERE tournament_id=?", (tid,))):
+        pool_keys = [g.key for g in games if g.division_id == b["division_id"]]
+        games += brackets.game_specs_for_engine(b, pool_keys)
+        for sp in brackets.structure(b["id"], b["size"], bool(b["third_place"])):
+            src[sp["key"]] = (b["id"], sp["src_a"], sp["src_b"])
+    sch = engine.Scheduler(s, venues, courts, divs, teams, prefs, crews, games=games, seed=body.seed,
+                           coach_gaps=s.coach_gaps)
     res = sch.run(body.time_limit)
     c.conn.execute("DELETE FROM games WHERE tournament_id=?", (tid,))
     for g in sch.games:
         p = res.placements.get(g.key)
+        bid, sa, sb = src.get(g.key, (None, None, None))
         if p:
             st, en = s.abs_to_iso(p.start), s.abs_to_iso(p.end)
             c.conn.execute("INSERT INTO games(tournament_id,key,division_id,pool,round,team_a,team_b,court_id,start_at,"
-                           "end_at,original_start_at,ref_crew_id,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'scheduled')",
+                           "end_at,original_start_at,ref_crew_id,status,bracket_id,src_a,src_b) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'scheduled',?,?,?)",
                            (tid, g.key, g.division_id, g.pool, g.round, g.team_a, g.team_b, p.court_id, st, en, st,
-                            p.ref_crew_id))
+                            p.ref_crew_id, bid, sa, sb))
         else:
-            c.conn.execute("INSERT INTO games(tournament_id,key,division_id,pool,round,team_a,team_b,status) "
-                           "VALUES (?,?,?,?,?,?,?, 'unscheduled')",
-                           (tid, g.key, g.division_id, g.pool, g.round, g.team_a, g.team_b))
+            c.conn.execute("INSERT INTO games(tournament_id,key,division_id,pool,round,team_a,team_b,status,"
+                           "bracket_id,src_a,src_b) VALUES (?,?,?,?,?,?,?, 'unscheduled',?,?,?)",
+                           (tid, g.key, g.division_id, g.pool, g.round, g.team_a, g.team_b, bid, sa, sb))
+    brackets.resolve(c.conn, tid)
     _store_flags(c, tid, res.issues)
     vnames = {v.id: v.name for v in venues}
     stats = dict(res.stats)
@@ -851,18 +863,24 @@ def report(tid: int, c: Ctx = Depends(get_ctx)):
 
 def _games_payload(c, tid, public=False):
     sql = ("SELECT g.id,g.key,g.division_id,g.pool,g.round,g.team_a,g.team_b,g.court_id,g.start_at,g.end_at,"
-           "g.original_start_at,g.status,g.score_a,g.score_b,g.ref_crew_id,g.flags,"
-           "ta.name team_a_name, tb.name team_b_name, d.name division, c.name court, v.name venue, v.id venue_id, "
-           "r.name ref_crew FROM games g JOIN teams ta ON ta.id=g.team_a JOIN teams tb ON tb.id=g.team_b "
+           "g.original_start_at,g.status,g.score_a,g.score_b,g.ref_crew_id,g.flags,g.bracket_id,g.src_a,g.src_b,"
+           "g.locked,g.allow,ta.name team_a_name, tb.name team_b_name, d.name division, c.name court, v.name venue, "
+           "v.id venue_id, r.name ref_crew FROM games g LEFT JOIN teams ta ON ta.id=g.team_a "
+           "LEFT JOIN teams tb ON tb.id=g.team_b "
            "JOIN divisions d ON d.id=g.division_id LEFT JOIN courts c ON c.id=g.court_id "
            "LEFT JOIN venues v ON v.id=c.venue_id LEFT JOIN ref_crews r ON r.id=g.ref_crew_id "
            "WHERE g.tournament_id=? ORDER BY g.start_at IS NULL, g.start_at, v.id, c.id")
     games = db.rows(c.conn.execute(sql, (tid,)))
-    if public:
-        for g in games:
-            g.pop("flags", None)
-            g.pop("ref_crew", None)
-            g.pop("ref_crew_id", None)
+    lab = brackets.labels(c.conn, tid) if any(g["bracket_id"] for g in games) else {}
+    for g in games:
+        L = lab.get(g["key"])
+        if L:
+            g["bracket"], g["round_name"], g["short"] = L["bracket"], L["round_name"], L["short"]
+            g["team_a_name"] = g["team_a_name"] or L["label_a"]
+            g["team_b_name"] = g["team_b_name"] or L["label_b"]
+        if public:
+            for k in ("flags", "ref_crew", "ref_crew_id", "locked", "allow"):
+                g.pop(k, None)
     return games
 
 
@@ -909,12 +927,44 @@ def _notify_changes(c, tid, before: dict, s):
         old = before.get(g["id"])
         if not old or (old[0], old[1]) == (g["start_at"], g["court_id"]):
             continue
-        when = g["start_at"].replace("T", " ") if g["start_at"] else "TBD"
+        when = fmt_when(g["start_at"])
         m = f"{g['team_a_name']} vs {g['team_b_name']} now starts {when} at {g['venue']} {g['court']}"
-        for team in (g["team_a"], g["team_b"]):
+        ids = [x for x in (g["team_a"], g["team_b"]) if x is not None]
+        for team in ids:
             c.conn.execute("INSERT INTO notifications(tournament_id,team_id,message) VALUES (?,?,?)", (tid, team, m))
-        msgs.append({"team_ids": [g["team_a"], g["team_b"]], "message": m})
+        if ids:
+            msgs.append({"team_ids": ids, "message": m})
     return msgs
+
+
+def _advance(c, tid):
+    """Fill bracket slots after results change; tell teams who they play next. Returns broker events."""
+    changed, alerts = brackets.resolve(c.conn, tid)
+    events = [{"type": "staff_alert", "message": f"Bracket tie: {a}"} for a in alerts]
+    for a in alerts:
+        audit(c, tid, "bracket.tie", a)
+    if not changed:
+        return events
+    for g in _games_payload(c, tid):
+        if g["id"] not in changed:
+            continue
+        when = f"{fmt_when(g['start_at'])} at {g['venue']} {g['court']}" if g["start_at"] else "time TBD"
+        for me, other, opp in ((g["team_a"], g["team_b"], g["team_b_name"]), (g["team_b"], g["team_a"], g["team_a_name"])):
+            if me is None:
+                continue
+            rnd = g["round_name"].lower()
+            m = (f"{g['bracket']}: you play {opp} in the {rnd}, {when}" if other is not None else
+                 f"{g['bracket']}: you're in the {rnd}, {when}. Opponent: {opp}")
+            c.conn.execute("INSERT INTO notifications(tournament_id,team_id,message) VALUES (?,?,?)", (tid, me, m))
+            events.append({"type": "notification", "team_ids": [me], "message": m})
+    return events
+
+
+def fmt_when(iso):
+    if not iso:
+        return "TBD"
+    d = datetime.fromisoformat(iso)
+    return f"{d.strftime('%a')} {d.month}/{d.day} {d.hour % 12 or 12}:{d.minute:02d} {'PM' if d.hour >= 12 else 'AM'}"
 
 
 class DelayIn(BaseModel):
@@ -966,12 +1016,24 @@ def court_delay(cid: int, body: DelayIn, c: Ctx = Depends(get_ctx)):
     return {"moved": len(msgs), "hard_issues": hard_new}
 
 
+RULE_TYPES = {"rest", "team_travel", "coach_conflict", "too_many_games", "unavailable", "bracket_order"}
+
+
 class GameIn(BaseModel):
     status: Optional[str] = None
     score_a: Optional[int] = Field(None, ge=0, le=300)
     score_b: Optional[int] = Field(None, ge=0, le=300)
     court_id: Optional[int] = None
     start_at: Optional[str] = None
+    locked: Optional[bool] = None
+    allow: Optional[list[str]] = None  # rule types waived for this game ("back-to-back on purpose")
+
+
+def _settings(t):
+    return engine.Settings(start_date=t["start_date"], end_date=t["end_date"], game_minutes=t["game_minutes"],
+                           buffer_minutes=t["buffer_minutes"], min_rest_minutes=t["min_rest_minutes"],
+                           travel_buffer_minutes=t["travel_buffer_minutes"], max_games_per_day=t["max_games_per_day"],
+                           day_start=t["day_start"], day_end=t["day_end"])
 
 
 @app.patch("/api/games/{gid}")
@@ -980,17 +1042,38 @@ def update_game(gid: int, body: GameIn, c: Ctx = Depends(get_ctx)):
     tid = g["tournament_id"]
     role = _director_check(c, tid, g["venue_id"])
     d = body.model_dump(exclude_none=True)
-    if "status" in d and d["status"] not in ("scheduled", "in_progress", "final"):
+    if "status" in d and d["status"] not in ("scheduled", "in_progress", "final", "unscheduled"):
         raise HTTPException(400, "Bad status.")
+    if role == "director" and ({"locked", "allow"} & set(d) or d.get("status") == "unscheduled"):
+        raise HTTPException(403, "Only admins can change the schedule.")
+    if g["bracket_id"] and ("score_a" in d or "score_b" in d or d.get("status") in ("in_progress", "final")):
+        if g["team_a"] is None or g["team_b"] is None:
+            raise HTTPException(400, "Both teams in this bracket game aren't known yet.")
+        if d.get("status", g["status"]) == "final" and d.get("score_a", g["score_a"]) == d.get("score_b", g["score_b"]):
+            raise HTTPException(400, "Bracket games need a winner. Enter the final score after overtime.")
+    if "allow" in d:
+        bad = set(d["allow"]) - RULE_TYPES
+        if bad:
+            raise HTTPException(400, f"Unknown rule: {', '.join(sorted(bad))}")
+        d["allow"] = ",".join(sorted(set(d["allow"])))
+    if "locked" in d:
+        d["locked"] = int(d["locked"])
     moved = "court_id" in d or "start_at" in d
-    if moved:
+    if d.get("status") == "unscheduled":
+        if g["status"] in ("final", "in_progress"):
+            raise HTTPException(400, "That game has started.")
+        d.update(court_id=None, start_at=None, end_at=None, locked=0)
+        moved = False
+    elif moved:
         if role == "director":
             raise HTTPException(403, "Only admins can move games between slots.")
         t = one(c, "SELECT * FROM tournaments WHERE id=?", tid)
-        s = engine.Settings(start_date=t["start_date"], end_date=t["end_date"], game_minutes=t["game_minutes"])
+        s = _settings(t)
         if "court_id" in d:
             one(c, "SELECT c.id FROM courts c JOIN venues v ON v.id=c.venue_id WHERE c.id=? AND v.tournament_id=?",
                 d["court_id"], tid)
+        elif not g["court_id"]:
+            raise HTTPException(400, "Pick a court.")
         start = d.get("start_at") or g["start_at"]
         try:
             st = s.iso_to_abs(start)
@@ -1000,6 +1083,13 @@ def update_game(gid: int, body: GameIn, c: Ctx = Depends(get_ctx)):
             raise HTTPException(400, "That time is outside the tournament dates.")
         d["start_at"] = s.abs_to_iso(st)
         d["end_at"] = s.abs_to_iso(st + t["game_minutes"])
+        court = d.get("court_id", g["court_id"])
+        clash = c.conn.execute(
+            "SELECT id FROM games WHERE court_id=? AND id<>? AND start_at IS NOT NULL AND start_at<? AND end_at>?",
+            (court, gid, d["end_at"], d["start_at"])).fetchone()
+        if clash:
+            raise HTTPException(409, "Another game is already on that court at that time.")
+        d.setdefault("locked", 1)  # a game the director placed by hand stays put when re-optimizing
         if g["status"] == "unscheduled":
             d.setdefault("status", "scheduled")
             d["original_start_at"] = d["start_at"]
@@ -1007,14 +1097,109 @@ def update_game(gid: int, body: GameIn, c: Ctx = Depends(get_ctx)):
     if d:
         c.conn.execute(f"UPDATE games SET {','.join(k + '=?' for k in d)} WHERE id=?", [*d.values(), gid])
     msgs = _notify_changes(c, tid, before, None) if moved else []
+    events = _advance(c, tid) if {"score_a", "score_b", "status"} & set(d) else []
     issues, _, _ = current_issues(c, tid)
     _store_flags(c, tid, issues)
     c.conn.commit()
     broker.publish(tid, {"type": "games_changed"})
     for m in msgs:
         broker.publish(tid, {"type": "notification", **m})
+    for e in events:
+        broker.publish(tid, e)
     mine = [i for i in issues if g["key"] in i["games"]]
     return {"ok": True, "issues": mine}
+
+
+@app.get("/api/games/{gid}/check")
+def check_slots(gid: int, day: str, c: Ctx = Depends(get_ctx)):
+    """For drag and drop: which times on `day` (at each venue) break a rule for this game, and why.
+
+    Court occupancy is left to the client, which already knows which cells hold a game."""
+    g = one(c, "SELECT * FROM games WHERE id=?", gid)
+    tid = g["tournament_id"]
+    auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
+    t, s, venues, courts, divs, teams, prefs, crews = load_ctx(c, tid)
+    try:
+        d0 = s.day_index(day)
+    except Exception:
+        raise HTTPException(400, "day must be YYYY-MM-DD")
+    sch = engine.Scheduler(s, venues, courts, divs, teams, prefs, crews, games=[], coach_gaps=s.coach_gaps)
+    rows = db.rows(c.conn.execute("SELECT * FROM games WHERE tournament_id=?", (tid,)))
+    deps = brackets.deps_from_rows(rows)
+    others = [x for x in _game_dicts(s, rows, sch.courts) if x["key"] != g["key"]]
+    # Only games that share a team, a coach or a bracket link with this one can conflict with it.
+    mine = {g["team_a"], g["team_b"]} - {None}
+    coaches = {sch.teams[x].coach_id for x in mine if x in sch.teams} - {None}
+    mates = mine | {x for x in sch.teams if sch.teams[x].coach_id in coaches}
+    linked = set(deps.get(g["key"], ())) | {k for k, v in deps.items() if g["key"] in v}
+    near = [x for x in others if {x["team_a"], x["team_b"]} & mates or x["key"] in linked]
+    dep_sub = {k: v for k, v in deps.items() if k == g["key"] or g["key"] in v}
+    home = {dv.id: dv.home_venue_id for dv in divs if dv.home_venue_id} or sch.home
+    allow = [a for a in (g["allow"] or "").split(",") if a]
+    cells = {}
+    for v in venues:
+        open_m = engine.hm_to_min(v.open_time or s.day_start)
+        close_m = engine.hm_to_min(v.close_time or s.day_end)
+        m = open_m
+        while m + s.game_minutes <= close_m:
+            st = d0 * engine.DAY + m
+            cand = dict(key=g["key"], id=g["id"], team_a=g["team_a"], team_b=g["team_b"], start=st,
+                        end=st + s.game_minutes, court_id=None, venue_id=v.id, division_id=g["division_id"],
+                        ref_crew_id=None, allow=allow)
+            iss = [i for i in engine.validate(s, sch.venues, sch.courts, sch.teams, sch.divisions, near + [cand],
+                                              sch.hard_windows, sch.soft_prefs, home, sch.coach_gaps, deps=dep_sub)
+                   if g["key"] in i["games"] and i["type"] != "court_overlap"]
+            hard = [i["message"] for i in iss if i["severity"] == "hard"]
+            soft = [i["message"] for i in iss if i["severity"] == "soft"]
+            cells[f"{v.id}|{engine.min_to_hm(m)}"] = dict(level="hard" if hard else "soft" if soft else "ok",
+                                                          reasons=hard + soft)
+            m += s.slot_minutes
+    return {"day": day, "cells": cells}
+
+
+def _replan(c, tid, move_keys, from_abs, time_limit, kind):
+    """Re-place `move_keys` with every other game held where it is."""
+    issues, rows, s = current_issues(c, tid)
+    t, s, venues, courts, divs, teams, prefs, crews = load_ctx(c, tid)
+    cmap = {x.id for x in courts}
+    deps = brackets.deps_from_rows(rows)
+    movable, fixed = [], []
+    for r in rows:
+        after = tuple(deps.get(r["key"], ()))
+        if r["key"] in move_keys:
+            movable.append(engine.Game(r["key"], r["division_id"], r["pool"] or "", r["round"] or 0,
+                                       r["team_a"], r["team_b"], after=after, phase=1 if r["bracket_id"] else 0))
+        elif r["start_at"] and r["court_id"] in cmap:
+            fixed.append(engine.Fixed(r["key"], r["team_a"], r["team_b"], r["court_id"],
+                                      s.iso_to_abs(r["start_at"]), s.iso_to_abs(r["end_at"]), after=after))
+    if not movable:
+        return None
+    sch = engine.Scheduler(s, venues, courts, divs, teams, prefs, crews, fixed=fixed, games=movable,
+                           not_before=from_abs, coach_gaps=s.coach_gaps)
+    res = sch.run(time_limit)
+    before = {r["id"]: (r["start_at"], r["court_id"]) for r in rows}
+    for g in movable:
+        p = res.placements.get(g.key)
+        if p:
+            c.conn.execute("UPDATE games SET court_id=?, start_at=?, end_at=?, status='scheduled', ref_crew_id=?, "
+                           "original_start_at=COALESCE(original_start_at, ?) WHERE tournament_id=? AND key=?",
+                           (p.court_id, s.abs_to_iso(p.start), s.abs_to_iso(p.end), p.ref_crew_id,
+                            s.abs_to_iso(p.start), tid, g.key))
+        else:
+            c.conn.execute("UPDATE games SET court_id=NULL, start_at=NULL, end_at=NULL, status='unscheduled' "
+                           "WHERE tournament_id=? AND key=?", (tid, g.key))
+    msgs = _notify_changes(c, tid, before, s)
+    issues, _, _ = current_issues(c, tid)
+    _store_flags(c, tid, issues)
+    remaining = [i for i in issues if i["severity"] == "hard"]
+    c.conn.execute("INSERT INTO schedule_runs(tournament_id,kind,created_by,stats,issues) VALUES (?,?,?,?,?)",
+                   (tid, kind, c.user["id"], json.dumps(res.stats), json.dumps(issues)))
+    audit(c, tid, f"schedule.{kind}", f"moved {len(msgs)}")
+    c.conn.commit()
+    broker.publish(tid, {"type": "games_changed"})
+    for m in msgs:
+        broker.publish(tid, {"type": "notification", **m})
+    return {"moved": len(msgs), "unplaced": res.unscheduled, "remaining_hard": len(remaining)}
 
 
 class RepairIn(BaseModel):
@@ -1027,52 +1212,173 @@ def repair(tid: int, body: RepairIn, c: Ctx = Depends(get_ctx)):
     """Re-place only conflicted/unscheduled games after `from_at`, keeping everything else locked."""
     auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
     issues, rows, s = current_issues(c, tid)
-    bad = {k for i in issues if i["severity"] == "hard" for k in i["games"]}
     from_abs = s.iso_to_abs(body.from_at) if body.from_at else 0
-    t, s, venues, courts, divs, teams, prefs, crews = load_ctx(c, tid)
-    cmap = {x.id for x in courts}
-    movable, fixed = [], []
-    # For each hard issue only move the later game(s) so earlier games stay put.
-    move_keys = set()
+    # For each hard issue only move the later game(s) so earlier games stay put. Locked games never move.
+    move_keys = {r["key"] for r in rows if r["status"] == "unscheduled"}
     for i in issues:
         if i["severity"] != "hard":
             continue
         gs = sorted((r for r in rows if r["key"] in i["games"] and r["start_at"]), key=lambda r: r["start_at"])
-        cands = [r for r in gs if r["status"] == "scheduled" and s.iso_to_abs(r["start_at"]) >= from_abs]
+        cands = [r for r in gs if r["status"] == "scheduled" and not r["locked"]
+                 and s.iso_to_abs(r["start_at"]) >= from_abs]
         if cands:
             move_keys.add(cands[-1]["key"])
-    for r in rows:
-        if r["status"] == "unscheduled" or r["key"] in move_keys:
-            movable.append(engine.Game(r["key"], r["division_id"], r["pool"] or "", r["round"] or 0,
-                                       r["team_a"], r["team_b"]))
-        elif r["start_at"] and r["court_id"] in cmap:
-            fixed.append(engine.Fixed(r["key"], r["team_a"], r["team_b"], r["court_id"],
-                                      s.iso_to_abs(r["start_at"]), s.iso_to_abs(r["end_at"])))
-    if not movable:
+    out = _replan(c, tid, move_keys, from_abs, body.time_limit, "repair")
+    if out is None:
         return {"moved": 0, "remaining_hard": len([i for i in issues if i["severity"] == "hard"]),
                 "message": "Nothing to repair."}
-    sch = engine.Scheduler(s, venues, courts, divs, teams, prefs, crews, fixed=fixed, games=movable,
-                           not_before=from_abs, coach_gaps=s.coach_gaps)
-    res = sch.run(body.time_limit)
-    before = {r["id"]: (r["start_at"], r["court_id"]) for r in rows}
-    for g in movable:
-        p = res.placements.get(g.key)
-        if p:
-            c.conn.execute("UPDATE games SET court_id=?, start_at=?, end_at=?, status='scheduled', "
-                           "original_start_at=COALESCE(original_start_at, ?) WHERE tournament_id=? AND key=?",
-                           (p.court_id, s.abs_to_iso(p.start), s.abs_to_iso(p.end), s.abs_to_iso(p.start), tid, g.key))
-    msgs = _notify_changes(c, tid, before, s)
+    return out
+
+
+class OptimizeIn(BaseModel):
+    time_limit: float = Field(6.0, ge=1, le=60)
+
+
+@app.post("/api/t/{tid}/schedule/optimize")
+def optimize(tid: int, body: OptimizeIn, c: Ctx = Depends(get_ctx)):
+    """Re-plan every game that isn't locked, started or finished. Matchups stay the same."""
+    auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
+    rows = db.rows(c.conn.execute("SELECT key,status,locked FROM games WHERE tournament_id=?", (tid,)))
+    keys = {r["key"] for r in rows if not r["locked"] and r["status"] in ("scheduled", "unscheduled")}
+    out = _replan(c, tid, keys, None, body.time_limit, "optimize")
+    if out is None:
+        return {"moved": 0, "remaining_hard": 0, "message": "Every game is locked or underway."}
+    out["locked"] = sum(1 for r in rows if r["locked"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Brackets
+# ---------------------------------------------------------------------------
+
+class BracketIn(BaseModel):
+    division_id: int
+    name: str = Field("Championship", min_length=1, max_length=60)
+    size: int = Field(ge=2, le=brackets.MAX_SIZE)
+    seeding: str = "pool"
+    third_place: bool = False
+
+
+def _bracket_view(c, b, games_by_key):
+    specs = brackets.structure(b["id"], b["size"], bool(b["third_place"]))
+    by_key = {s["key"]: s for s in specs}
+    seeds = json.loads(b["seeds"]) if b["seeds"] else None
+    names = {r["id"]: r["name"] for r in c.conn.execute("SELECT id,name FROM teams WHERE division_id=?",
+                                                        (b["division_id"],))}
+    out = dict(b)
+    out.pop("seeds")
+    out["manual_seeds"] = seeds
+    resolved = {}
+    games = []
+    for sp in specs:
+        g = games_by_key.get(sp["key"], {})
+        games.append(dict(key=sp["key"], id=g.get("id"), round=sp["round"], slot=sp["slot"], name=sp["name"],
+                          short=sp["short"], src_a=sp["src_a"], src_b=sp["src_b"],
+                          label_a=brackets.source_label(sp["src_a"], by_key),
+                          label_b=brackets.source_label(sp["src_b"], by_key),
+                          team_a=g.get("team_a"), team_b=g.get("team_b"),
+                          team_a_name=names.get(g.get("team_a")), team_b_name=names.get(g.get("team_b")),
+                          start_at=g.get("start_at"), venue=g.get("venue"), court=g.get("court"),
+                          status=g.get("status"), score_a=g.get("score_a"), score_b=g.get("score_b")))
+        for src, t in ((sp["src_a"], g.get("team_a")), (sp["src_b"], g.get("team_b"))):
+            if src.startswith("S") and t:
+                resolved[int(src[1:])] = t
+    out["games"] = games
+    out["rounds"] = max((sp["round"] for sp in specs), default=0)
+    out["seed_list"] = [dict(seed=n, team_id=(seeds[n - 1] if seeds else resolved.get(n)),
+                             team=names.get(seeds[n - 1] if seeds else resolved.get(n)))
+                        for n in range(1, b["size"] + 1)]
+    return out
+
+
+def _brackets_payload(c, tid, public=False):
+    games = {g["key"]: g for g in _games_payload(c, tid, public=public)}
+    return [_bracket_view(c, dict(b), games) for b in c.conn.execute(
+        "SELECT b.*, d.name division FROM brackets b JOIN divisions d ON d.id=b.division_id "
+        "WHERE b.tournament_id=? ORDER BY d.name, b.id", (tid,))]
+
+
+@app.get("/api/t/{tid}/brackets")
+def list_brackets(tid: int, c: Ctx = Depends(get_ctx)):
+    role = auth.require_role(c.conn, c.user, tid, auth.STAFF_ROLES | {"team"})
+    return {"brackets": _brackets_payload(c, tid, public=role == "team")}
+
+
+@app.post("/api/t/{tid}/brackets")
+def create_bracket(tid: int, body: BracketIn, c: Ctx = Depends(get_ctx)):
+    auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
+    div = one(c, "SELECT * FROM divisions WHERE id=? AND tournament_id=?", body.division_id, tid)
+    if body.seeding not in ("pool", "division"):
+        raise HTTPException(400, "Seeding must be 'pool' or 'division'.")
+    n = c.conn.execute("SELECT COUNT(*) n FROM teams WHERE division_id=?", (div["id"],)).fetchone()["n"]
+    if body.size > n:
+        raise HTTPException(400, f"{div['name']} only has {n} teams.")
+    if c.conn.execute("SELECT 1 FROM brackets WHERE division_id=? AND name=?", (div["id"], body.name)).fetchone():
+        raise HTTPException(400, f"{div['name']} already has a bracket called {body.name}.")
+    bid = c.conn.execute("INSERT INTO brackets(tournament_id,division_id,name,size,seeding,third_place) "
+                         "VALUES (?,?,?,?,?,?)", (tid, div["id"], body.name, body.size, body.seeding,
+                                                  int(body.third_place))).lastrowid
+    for sp in brackets.structure(bid, body.size, body.third_place):
+        c.conn.execute("INSERT INTO games(tournament_id,key,division_id,round,status,bracket_id,src_a,src_b) "
+                       "VALUES (?,?,?,?, 'unscheduled',?,?,?)",
+                       (tid, sp["key"], div["id"], sp["round"], bid, sp["src_a"], sp["src_b"]))
+    audit(c, tid, "bracket.create", f"{div['name']} {body.name} ({body.size})")
+    c.conn.commit()
+    placed = None
+    has_pool = c.conn.execute("SELECT 1 FROM games WHERE division_id=? AND bracket_id IS NULL AND start_at IS NOT NULL",
+                              (div["id"],)).fetchone()
+    if has_pool:
+        keys = {r["key"] for r in c.conn.execute("SELECT key FROM games WHERE bracket_id=?", (bid,))}
+        placed = _replan(c, tid, keys, None, 4.0, "bracket")
+    events = _advance(c, tid)
+    c.conn.commit()
+    for e in events:
+        broker.publish(tid, e)
+    broker.publish(tid, {"type": "games_changed"})
+    return {"id": bid, "placed": placed}
+
+
+class SeedsIn(BaseModel):
+    team_ids: Optional[list[int]] = None  # None = back to automatic seeding
+
+
+@app.put("/api/brackets/{bid}/seeds")
+def set_seeds(bid: int, body: SeedsIn, c: Ctx = Depends(get_ctx)):
+    b = one(c, "SELECT * FROM brackets WHERE id=?", bid)
+    tid = b["tournament_id"]
+    auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
+    if c.conn.execute("SELECT 1 FROM games WHERE bracket_id=? AND status IN ('final','in_progress')",
+                      (bid,)).fetchone():
+        raise HTTPException(409, "Bracket play has started, so the seeds can't change.")
+    if body.team_ids is not None:
+        ids = body.team_ids
+        valid = {r["id"] for r in c.conn.execute("SELECT id FROM teams WHERE division_id=?", (b["division_id"],))}
+        if len(ids) != b["size"] or len(set(ids)) != len(ids) or not set(ids) <= valid:
+            raise HTTPException(400, f"Pick {b['size']} different teams from this division.")
+    c.conn.execute("UPDATE brackets SET seeds=? WHERE id=?", (json.dumps(body.team_ids) if body.team_ids else None, bid))
+    audit(c, tid, "bracket.seeds", "manual" if body.team_ids else "auto")
+    events = _advance(c, tid)
     issues, _, _ = current_issues(c, tid)
     _store_flags(c, tid, issues)
-    remaining = [i for i in issues if i["severity"] == "hard"]
-    c.conn.execute("INSERT INTO schedule_runs(tournament_id,kind,created_by,stats,issues) VALUES (?,?,?,?,?)",
-                   (tid, "repair", c.user["id"], json.dumps(res.stats), json.dumps(issues)))
-    audit(c, tid, "schedule.repair", f"moved {len(msgs)}")
+    c.conn.commit()
+    for e in events:
+        broker.publish(tid, e)
+    broker.publish(tid, {"type": "games_changed"})
+    return {"ok": True}
+
+
+@app.delete("/api/brackets/{bid}")
+def delete_bracket(bid: int, c: Ctx = Depends(get_ctx)):
+    b = one(c, "SELECT * FROM brackets WHERE id=?", bid)
+    tid = b["tournament_id"]
+    auth.require_role(c.conn, c.user, tid, auth.ADMIN_ROLES)
+    c.conn.execute("DELETE FROM brackets WHERE id=?", (bid,))
+    audit(c, tid, "bracket.delete", b["name"])
+    issues, _, _ = current_issues(c, tid)
+    _store_flags(c, tid, issues)
     c.conn.commit()
     broker.publish(tid, {"type": "games_changed"})
-    for m in msgs:
-        broker.publish(tid, {"type": "notification", **m})
-    return {"moved": len(msgs), "unplaced": res.unscheduled, "remaining_hard": len(remaining)}
+    return {"ok": True}
 
 
 class PublishIn(BaseModel):
@@ -1131,6 +1437,8 @@ async def _sse(tid: int, request: Request, team_filter=None):
                 yield ": ping\n\n"
                 continue
             ev = json.loads(data)
+            if team_filter is not None and ev.get("type") == "staff_alert":
+                continue
             if team_filter is not None and ev.get("type") == "notification":
                 ids = ev.get("team_ids")
                 if ids and not set(ids) & team_filter:
@@ -1174,7 +1482,8 @@ def public_schedule(slug: str, c: Ctx = Depends(get_ctx)):
     games = [g for g in _games_payload(c, t["id"], public=True) if g["status"] != "unscheduled"]
     notes = db.rows(c.conn.execute("SELECT message, created_at FROM notifications WHERE tournament_id=? AND "
                                    "team_id IS NULL ORDER BY id DESC LIMIT 10", (t["id"],)))
-    return {"tournament": t, "games": games, "announcements": notes, "standings": engine.standings(games)}
+    return {"tournament": t, "games": games, "announcements": notes, "standings": engine.standings(games),
+            "brackets": _brackets_payload(c, t["id"], public=True)}
 
 
 @app.get("/api/public/{slug}/stream")
