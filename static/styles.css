@@ -103,13 +103,14 @@ th { font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; color:
 .qr { width: 220px; height: 220px; background: #fff; border-radius: 8px; padding: 6px; }
 .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; background: var(--bg); padding: .1rem .35rem; border-radius: 5px; }
 .hide { display: none !important; }
+.site-footer { text-align: center; padding: 1.5rem 1rem 2rem; }
 @media (max-width: 640px) {
   main { padding: .8rem; }
   .list-game { grid-template-columns: 1fr; gap: .2rem; }
   .topbar { padding: .5rem .8rem; }
 }
 @media print {
-  .topbar, .tabs, button { display: none !important; }
+  .topbar, .tabs, button, .site-footer { display: none !important; }
   .card { box-shadow: none; }
 }
 tr.me td { background: var(--brand-soft); font-weight: 600; }

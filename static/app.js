@@ -756,4 +756,5 @@ async function viewPublic(slug) {
 }
 
 // ---------------------------------------------------------------- boot
+fetch("/api/version").then(r => r.json()).then(v => { document.getElementById("app-version").textContent = `v${v.version}`; }).catch(() => {});
 (async () => { try { await loadMe(); } catch (e) { S.me = null; } route(); })();

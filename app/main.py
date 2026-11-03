@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import ai, auth, db, engine
+from . import __version__, ai, auth, db, engine
 from .events import broker
 
 STATIC = os.path.join(os.path.dirname(__file__), "..", "static")
@@ -28,7 +28,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="AI Tournament Scheduler", docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="AI Tournament Scheduler", version=__version__, docs_url="/api/docs", redoc_url=None, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +166,11 @@ def logout(request: Request, response: Response, c: Ctx = Depends(get_ctx)):
         auth.destroy_session(c.conn, tok)
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return {"ok": True}
+
+
+@app.get("/api/version")
+def version():
+    return {"name": "CourtPlan", "version": __version__}
 
 
 @app.get("/api/me")
