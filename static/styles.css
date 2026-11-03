@@ -116,3 +116,38 @@ tr.me td { background: var(--brand-soft); font-weight: 600; }
 .row > input, .row > select { width: auto; min-width: 160px; flex: 0 1 auto; }
 .row > input[name=message], .row > input[name=code], .row > input[name=q] { flex: 1 1 240px; }
 td .row > select { min-width: 140px; }
+
+/* drag-and-drop schedule grid */
+.sched.dnd td.cell { min-height: 56px; border-radius: 8px; }
+.sched.dnd td.closed .empty-slot { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--line) 6px 7px); border-style: solid; }
+.game[draggable="true"] { cursor: grab; }
+.game.ghost { opacity: .35; }
+.game.dim { opacity: .22; }
+.game.same-team { outline: 2px solid var(--info); outline-offset: 1px; }
+.game .tbd { color: var(--muted); font-style: italic; font-weight: 500; }
+.game.is-bracket { border-left-style: double; border-left-width: 5px; }
+.game .lock { color: var(--muted); }
+.dragging td.drop-ok .empty-slot { background: var(--ok-soft); border-color: var(--ok); }
+.dragging td.drop-soft .empty-slot { background: var(--warn-soft); border-color: var(--warn); }
+.dragging td.drop-hard .empty-slot { background: var(--bad-soft); border-color: var(--bad); border-style: dashed; }
+.dragging td.drop-busy .game:not(.ghost) { opacity: .55; }
+.dragging td.over .empty-slot { outline: 2px solid var(--brand); outline-offset: -2px; }
+.tray { border: 2px dashed var(--line); border-radius: var(--radius); padding: .6rem .7rem; margin: .6rem 0 .8rem; }
+.tray.over { border-color: var(--brand); background: var(--brand-soft); }
+.tray-games { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; margin-top: .5rem; }
+.tray-games:empty { display: none; }
+
+/* brackets */
+.bracket-wrap { overflow-x: auto; padding-bottom: .4rem; }
+.bracket { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(210px, 1fr); gap: 1.2rem; align-items: stretch; }
+.bround { display: flex; flex-direction: column; justify-content: space-around; gap: .8rem; }
+.bgame { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .45rem .6rem; font-size: .86rem; cursor: pointer; position: relative; }
+.bgame:hover { border-color: var(--muted); }
+.bround + .bround .bgame::before { content: ""; position: absolute; left: -1.2rem; top: 50%; width: 1.2rem; border-top: 1px solid var(--line); }
+.bgame .side { display: flex; justify-content: space-between; gap: .5rem; padding: .15rem 0; font-weight: 600; }
+.bgame .side + .side { border-top: 1px solid var(--line); }
+.bgame .side.tbd { color: var(--muted); font-style: italic; font-weight: 500; }
+.bgame .side.win { color: var(--ok); }
+.bgame.done { opacity: .85; }
+.third { max-width: 240px; margin-top: .8rem; }
+label.check { color: var(--ink); font-size: .95rem; padding: .45rem 0; margin: 0; }

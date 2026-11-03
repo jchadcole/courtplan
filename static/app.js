@@ -238,7 +238,7 @@ function viewNewTournament() {
 }
 
 // ---------------------------------------------------------------- tournament (staff)
-const TABS = [["overview", "Overview"], ["setup", "Venues & rules"], ["teams", "Teams"], ["schedule", "Schedule"], ["live", "Live control"], ["staff", "Staff & refs"], ["publish", "Publish"]];
+const TABS = [["overview", "Overview"], ["setup", "Venues & rules"], ["teams", "Teams"], ["schedule", "Schedule"], ["brackets", "Brackets"], ["live", "Live control"], ["staff", "Staff & refs"], ["publish", "Publish"]];
 
 async function viewTournament(tid, tab) {
   const data = await api(`/api/t/${tid}`);
@@ -246,7 +246,7 @@ async function viewTournament(tid, tab) {
   const isAdmin = data.role === "admin" || data.role === "superadmin";
   tab = tab || (data.role === "director" ? "live" : "overview");
   const t = data.tournament;
-  const tabs = h("nav", { class: "tabs" }, TABS.filter(([k]) => isAdmin || ["overview", "schedule", "live"].includes(k))
+  const tabs = h("nav", { class: "tabs" }, TABS.filter(([k]) => isAdmin || ["overview", "schedule", "brackets", "live"].includes(k))
     .map(([k, l]) => h("a", { href: `#/t/${tid}/${k}`, class: k === tab ? "active" : "" }, l)));
   const body = h("div", {});
   mount(h("div", { class: "spread" }, h("div", {}, h("h1", {}, t.name),
@@ -256,9 +256,10 @@ async function viewTournament(tid, tab) {
   const ctx = { tid, data, isAdmin, reload: () => viewTournament(tid, tab), body };
   live(`/api/t/${tid}/stream`, ev => {
     if (ev.type === "notification") toast(ev.message);
-    if (ev.type === "games_changed" && ["schedule", "live", "overview"].includes(tab)) ctx.refresh && ctx.refresh();
+    if (ev.type === "staff_alert") toast(ev.message, true);
+    if (ev.type === "games_changed" && ["schedule", "brackets", "live", "overview"].includes(tab) && !S.dragging) ctx.refresh && ctx.refresh();
   });
-  await ({ overview: tabOverview, setup: tabSetup, teams: tabTeams, schedule: tabSchedule, live: tabLive, staff: tabStaff, publish: tabPublish }[tab] || tabOverview)(ctx);
+  await ({ overview: tabOverview, setup: tabSetup, teams: tabTeams, schedule: tabSchedule, brackets: tabBrackets, live: tabLive, staff: tabStaff, publish: tabPublish }[tab] || tabOverview)(ctx);
 }
 
 async function tabOverview(ctx) {
@@ -418,16 +419,35 @@ function issueList(issues, limit = 50) {
       soft.slice(0, 80).map(i => h("div", { class: "issue soft small" }, i.message))) : null);
 }
 
-function gameCard(g, onClick) {
+const gameTag = g => g.bracket_id ? `${g.bracket} · ${g.round_name}` : `Pool ${g.pool}`;
+const tbdSide = (g, side) => g[side] === null && g.bracket_id;
+
+function gameCard(g, onClick, dnd) {
   const flags = g.flags || "";
-  const cls = ["game", flags.includes("hard:") ? "hard" : flags.includes("soft:") ? "soft" : "", g.status === "final" ? "final" : g.status === "in_progress" ? "live" : "", g.original_start_at && g.start_at !== g.original_start_at ? "moved" : ""].join(" ");
-  return h("div", { class: cls, onclick: () => onClick && onClick(g), title: flags.replace(/,/g, "\n") },
-    h("div", { class: "teams" }, g.team_a_name, " vs ", g.team_b_name),
-    h("div", { class: "muted" }, `${g.division} · Pool ${g.pool}`, g.ref_crew ? ` · ${g.ref_crew}` : ""),
-    h("div", { class: "when small" }, fmtTime(g.start_at), g.status === "final" ? ` · Final ${g.score_a}-${g.score_b}` : g.status === "in_progress" ? " · Live" : ""));
+  const cls = ["game", flags.includes("hard:") ? "hard" : flags.includes("soft:") ? "soft" : "", g.status === "final" ? "final" : g.status === "in_progress" ? "live" : "", g.original_start_at && g.start_at !== g.original_start_at ? "moved" : "", g.bracket_id ? "is-bracket" : ""].join(" ");
+  const canDrag = dnd && (g.status === "scheduled" || g.status === "unscheduled");
+  const el = h("div", { class: cls, onclick: () => onClick && onClick(g), title: flags.replace(/,/g, "\n"), draggable: canDrag ? "true" : null, "data-id": g.id },
+    h("div", { class: "teams" }, h("span", { class: tbdSide(g, "team_a") ? "tbd" : "" }, g.team_a_name), " vs ", h("span", { class: tbdSide(g, "team_b") ? "tbd" : "" }, g.team_b_name)),
+    h("div", { class: "muted" }, `${g.division} · ${gameTag(g)}`, g.ref_crew ? ` · ${g.ref_crew}` : ""),
+    h("div", { class: "when small" }, g.start_at ? fmtTime(g.start_at) : "Not placed", g.status === "final" ? ` · Final ${g.score_a}-${g.score_b}` : g.status === "in_progress" ? " · Live" : "",
+      g.locked ? h("span", { class: "lock", title: "Locked: re-optimizing won't move it" }, " · locked") : null));
+  if (canDrag) {
+    el.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", String(g.id)); e.dataTransfer.effectAllowed = "move"; dnd.start(g, el); });
+    el.addEventListener("dragend", () => dnd.end());
+  }
+  return el;
 }
 
-function scheduleGrid(games, data, day, venueId, onClick) {
+function slotTimes(data, venue) {
+  const t = data.tournament, step = t.game_minutes + t.buffer_minutes;
+  const toMin = x => { const [a, b] = x.split(":").map(Number); return a * 60 + b; };
+  const out = [];
+  for (let m = toMin((venue && venue.open_time) || t.day_start); m + t.game_minutes <= toMin((venue && venue.close_time) || t.day_end); m += step)
+    out.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+  return out;
+}
+
+function scheduleGrid(games, data, day, venueId, onClick, dnd) {
   const courts = data.courts.filter(c => !venueId || c.venue_id === Number(venueId));
   const gs = games.filter(g => g.start_at && g.start_at.startsWith(day) && courts.some(c => c.id === g.court_id));
   // Rows follow the planned slot, so a game running late stays in its row and shows its new time.
@@ -437,17 +457,35 @@ function scheduleGrid(games, data, day, venueId, onClick) {
     const late = o ? (new Date(g.start_at) - new Date(o)) / 60000 : 0;
     return (o && o.startsWith(day) && late > 0 && late < slotLen ? o : g.start_at).slice(11, 16);
   };
-  const times = [...new Set(gs.map(slotOf))].sort();
-  if (!gs.length) return h("p", { class: "muted" }, "No games on this day.");
-  const vname = Object.fromEntries(data.venues.map(v => [v.id, v.name]));
-  return h("div", { class: "tablewrap" }, h("table", { class: "sched" },
-    h("thead", {}, h("tr", {}, h("th", {}, ""), courts.map(c => h("th", {}, h("div", { class: "small muted" }, vname[c.venue_id]), c.name)))),
+  const venues = Object.fromEntries(data.venues.map(v => [v.id, v]));
+  const open = {};  // venue -> set of planned slot times
+  for (const c of courts) if (!open[c.venue_id]) open[c.venue_id] = new Set(slotTimes(data, venues[c.venue_id]));
+  const times = [...new Set([...gs.map(slotOf), ...(dnd ? Object.values(open).flatMap(x => [...x]) : [])])].sort();
+  if (!times.length) return h("p", { class: "muted" }, "No games on this day.");
+  return h("div", { class: "tablewrap" }, h("table", { class: "sched" + (dnd ? " dnd" : "") },
+    h("thead", {}, h("tr", {}, h("th", {}, ""), courts.map(c => h("th", {}, h("div", { class: "small muted" }, venues[c.venue_id].name), c.name)))),
     h("tbody", {}, times.map(tm => h("tr", {}, h("td", { class: "time" }, fmtTime(day + "T" + tm)),
-      courts.map(c => { const g = gs.find(x => x.court_id === c.id && slotOf(x) === tm); return h("td", {}, g ? gameCard(g, onClick) : h("div", { class: "empty-slot" })); }))))));
+      courts.map(c => {
+        const g = gs.find(x => x.court_id === c.id && slotOf(x) === tm);
+        if (!dnd) return h("td", {}, g ? gameCard(g, onClick) : h("div", { class: "empty-slot" }));
+        const isOpen = open[c.venue_id].has(tm);
+        const td = h("td", { class: isOpen ? "cell" : "cell closed", "data-court": c.id, "data-venue": c.venue_id, "data-time": tm, "data-busy": g ? String(g.id) : null },
+          g ? gameCard(g, onClick, dnd) : h("div", { class: "empty-slot" }));
+        if (isOpen) dnd.target(td);
+        return td;
+      }))))));
 }
+
+const WAIVABLE = [["rest", "Back-to-back / short rest"], ["team_travel", "Short travel time between venues"], ["coach_conflict", "Coach overlap"], ["too_many_games", "Over the daily game limit"], ["unavailable", "Team's blocked time"], ["bracket_order", "Bracket order"]];
 
 function editGame(ctx, g) {
   const { data, isAdmin } = ctx;
+  const allowed = new Set((g.allow || "").split(",").filter(Boolean));
+  const waive = WAIVABLE.map(([k, l]) => h("label", { class: "row small" }, h("input", { type: "checkbox", "data-allow": k, checked: allowed.has(k) }), " ", l));
+  const lock = h("input", { type: "checkbox", checked: !!g.locked });
+  const unsched = isAdmin && g.status === "scheduled" ? h("button", { type: "button", onclick: async e => {
+    if (await act(e.target, () => api(`/api/games/${g.id}`, { method: "PATCH", body: { status: "unscheduled" } }), "Moved to unplaced games")) { close(); ctx.refresh && ctx.refresh(); }
+  } }, "Unschedule") : null;
   const f = h("form", { class: "stack" },
     h("div", { class: "fields" },
       field("Status", sel("status", [["scheduled", "Scheduled"], ["in_progress", "In progress"], ["final", "Final"]], g.status === "unscheduled" ? "scheduled" : g.status)),
@@ -457,18 +495,26 @@ function editGame(ctx, g) {
       field("Court", sel("court_id", data.courts.map(c => [c.id, `${data.venues.find(v => v.id === c.venue_id).name} · ${c.name}`]), g.court_id)),
       field("Start", inp("start_at", { type: "datetime-local", value: g.start_at || `${data.tournament.start_date}T${data.tournament.day_start}` }))) : null,
     g.flags ? h("div", { class: "issue hard small" }, g.flags.replace(/,/g, ", ")) : null,
-    h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Save")));
+    isAdmin ? h("details", { open: !!(g.locked || allowed.size) || null }, h("summary", { class: "small" }, "Lock and rule overrides"),
+      h("label", { class: "row small" }, lock, " Locked: re-optimizing keeps this game where it is (set automatically when you drag a game)"),
+      h("p", { class: "small muted" }, "Allowed on purpose: these rules won't be flagged as conflicts for this game."), waive) : null,
+    h("div", { class: "row end" }, unsched, h("button", { class: "primary", type: "submit" }, "Save")));
   let close;
   f.onsubmit = async e => {
     e.preventDefault(); const b = formData(f);
+    for (const k of Object.keys(b)) if (k === "") delete b[k];
+    if (isAdmin) { b.locked = lock.checked; b.allow = [...f.querySelectorAll("[data-allow]")].filter(x => x.checked).map(x => x.dataset.allow); }
     if (b.score_a === null) delete b.score_a; if (b.score_b === null) delete b.score_b;
     if (b.court_id) b.court_id = Number(b.court_id);
     if (b.start_at === g.start_at) delete b.start_at;
     if (b.court_id === g.court_id) delete b.court_id;
+    if (b.status === g.status || (g.status === "unscheduled" && !b.start_at)) delete b.status;
+    if (tbdSide(g, "team_a") || tbdSide(g, "team_b")) { delete b.score_a; delete b.score_b; delete b.status; }
     const r = await act(f.querySelector("button"), () => api(`/api/games/${g.id}`, { method: "PATCH", body: b }));
     if (r) { r.issues.filter(i => i.severity === "hard").length ? toast("Saved, but this game now has a conflict: " + r.issues[0].message, true) : toast("Saved"); close(); ctx.refresh && ctx.refresh(); }
   };
-  close = modal(`${g.team_a_name} vs ${g.team_b_name}`, h("div", {}, h("p", { class: "muted" }, `${g.division} · Pool ${g.pool} · ${fmtWhen(g.start_at)} · ${g.venue || ""} ${g.court || ""}`), f));
+  close = modal(`${g.team_a_name} vs ${g.team_b_name}`, h("div", {}, h("p", { class: "muted" }, `${g.division} · ${gameTag(g)} · ${fmtWhen(g.start_at)} · ${g.venue || ""} ${g.court || ""}`),
+    g.bracket_id && (tbdSide(g, "team_a") || tbdSide(g, "team_b")) ? h("p", { class: "small muted" }, "The teams fill in automatically when the games feeding this one are final.") : null, f));
 }
 
 async function tabSchedule(ctx) {
@@ -489,6 +535,79 @@ async function tabSchedule(ctx) {
     const r = await act(e.target, () => api(`/api/t/${tid}/schedule/repair`, { body: {} }));
     if (r) { toast(r.message || `Moved ${r.moved} games. ${r.remaining_hard} hard conflicts remain.`); refresh(); }
   } }, "Repair conflicts");
+  const reopt = h("button", { title: "Re-plan every game that isn't locked or underway. Games you dragged stay put.", onclick: async e => {
+    e.target.textContent = "Optimizing…";
+    const r = await act(e.target, () => api(`/api/t/${tid}/schedule/optimize`, { body: { time_limit: Number(limit.value) } }));
+    e.target.textContent = "Re-optimize unlocked";
+    if (r) { toast(r.message || `Re-planned around ${r.locked} locked games. ${r.unplaced.length} unplaced, ${r.remaining_hard} hard conflicts.`); refresh(); }
+  } }, "Re-optimize unlocked");
+  const q = inp("q", { placeholder: "Highlight a team or club…", value: "" });
+  q.oninput = () => highlight();
+  const teamClub = Object.fromEntries(data.teams.map(t => [t.id, (t.club || "").toLowerCase()]));
+  function highlight() {
+    const v = q.value.trim().toLowerCase();
+    holder.querySelectorAll(".game[data-id]").forEach(el => {
+      const g = S.games && S.games[el.dataset.id];
+      const hit = !v || (g && [g.team_a_name, g.team_b_name, teamClub[g.team_a], teamClub[g.team_b]].join(" ").toLowerCase().includes(v));
+      el.classList.toggle("dim", !hit);
+    });
+  }
+
+  // ---- drag and drop
+  const dnd = !isAdmin ? null : {
+    drag: null,
+    start(g, el) {
+      S.dragging = true; this.drag = { g, cells: null };
+      holder.classList.add("dragging");
+      const mates = new Set([g.team_a, g.team_b].filter(x => x !== null));
+      const coaches = new Set(data.teams.filter(t => mates.has(t.id) && t.coach_id).map(t => t.coach_id));
+      data.teams.forEach(t => { if (coaches.has(t.coach_id)) mates.add(t.id); });
+      holder.querySelectorAll(".game[data-id]").forEach(c => {
+        const o = S.games[c.dataset.id];
+        if (o && o.id !== g.id && (mates.has(o.team_a) || mates.has(o.team_b))) c.classList.add("same-team");
+      });
+      setTimeout(() => el.classList.add("ghost"), 0);
+      api(`/api/games/${g.id}/check?day=${st.day}`).then(r => { if (this.drag && this.drag.g === g) { this.drag.cells = r.cells; this.paint(); } }).catch(() => {});
+    },
+    paint() {
+      const d = this.drag; if (!d) return;
+      holder.querySelectorAll("td.cell:not(.closed)").forEach(td => {
+        const busy = td.dataset.busy && td.dataset.busy !== String(d.g.id);
+        const c = d.cells && d.cells[`${td.dataset.venue}|${td.dataset.time}`];
+        td.classList.toggle("drop-busy", !!busy);
+        td.classList.toggle("drop-hard", !busy && !!c && c.level === "hard");
+        td.classList.toggle("drop-soft", !busy && !!c && c.level === "soft");
+        td.classList.toggle("drop-ok", !busy && !!c && c.level === "ok");
+        td.title = busy ? "Court in use" : c ? (c.reasons.join("\n") || "No conflicts") : "";
+      });
+    },
+    end() {
+      S.dragging = false; this.drag = null;
+      holder.classList.remove("dragging");
+      holder.querySelectorAll(".drop-ok,.drop-soft,.drop-hard,.drop-busy,.over").forEach(td => td.classList.remove("drop-ok", "drop-soft", "drop-hard", "drop-busy", "over"));
+      holder.querySelectorAll(".same-team,.ghost").forEach(c => c.classList.remove("same-team", "ghost"));
+    },
+    target(td) {
+      td.addEventListener("dragover", e => { if (!this.drag || td.classList.contains("drop-busy")) return; e.preventDefault(); td.classList.add("over"); });
+      td.addEventListener("dragleave", () => td.classList.remove("over"));
+      td.addEventListener("drop", async e => {
+        e.preventDefault(); const d = this.drag; if (!d) return;
+        const g = d.g, c = d.cells && d.cells[`${td.dataset.venue}|${td.dataset.time}`];
+        this.end();
+        if (c && c.level === "hard" && !confirm(`This breaks a rule:\n\n• ${c.reasons.filter((_, i) => i < 4).join("\n• ")}\n\nPlace it anyway? You can mark it as allowed on purpose afterwards.`)) return;
+        const r = await act(null, () => api(`/api/games/${g.id}`, { method: "PATCH", body: { court_id: Number(td.dataset.court), start_at: `${st.day}T${td.dataset.time}` } }));
+        if (r) { const hard = r.issues.filter(i => i.severity === "hard"); toast(hard.length ? `Placed with a conflict: ${hard[0].message}` : "Placed and locked", hard.length > 0); refresh(); }
+      });
+    },
+    tray(el) {
+      el.addEventListener("dragover", e => { if (this.drag && this.drag.g.status === "scheduled") { e.preventDefault(); el.classList.add("over"); } });
+      el.addEventListener("dragleave", () => el.classList.remove("over"));
+      el.addEventListener("drop", async e => {
+        e.preventDefault(); const d = this.drag; this.end(); if (!d) return;
+        if (await act(null, () => api(`/api/games/${d.g.id}`, { method: "PATCH", body: { status: "unscheduled" } }), "Moved to unplaced games")) refresh();
+      });
+    },
+  };
   function showRun(stats, issues) {
     result.replaceChildren(h("div", { class: "card" },
       h("h2", {}, "Last optimization"),
@@ -504,26 +623,108 @@ async function tabSchedule(ctx) {
   async function refresh() {
     const [{ games }, rep] = await Promise.all([api(`/api/t/${tid}/games`), api(`/api/t/${tid}/report`)]);
     if (rep.last_run && !result.childNodes.length) showRun(rep.last_run, rep.issues);
+    S.games = Object.fromEntries(games.map(g => [g.id, g]));
     const shown = games.filter(g => !st.division || g.division_id === Number(st.division));
     const unsched = games.filter(g => g.status === "unscheduled");
+    const trayGames = unsched.filter(g => !st.division || g.division_id === Number(st.division));
     const hardN = rep.issues.filter(i => i.severity === "hard").length;
     const controls = h("div", { class: "row" },
       sel("day", days.map(d => [d, fmtDay(d)]), st.day, { onchange: e => { st.day = e.target.value; refresh(); } }),
       sel("venue", [["", "All venues"], ...data.venues.map(v => [v.id, v.name])], st.venue, { onchange: e => { st.venue = e.target.value; refresh(); } }),
       sel("division", [["", "All divisions"], ...data.divisions.map(d => [d.id, d.name])], st.division, { onchange: e => { st.division = e.target.value; refresh(); } }),
-      h("a", { class: "btn", href: `/api/t/${tid}/export.csv` }, "Export CSV"), h("button", { onclick: () => window.print() }, "Print"));
+      q, h("a", { class: "btn", href: `/api/t/${tid}/export.csv` }, "Export CSV"), h("button", { onclick: () => window.print() }, "Print"));
+    const tray = isAdmin && games.length ? h("div", { class: "tray" }, h("div", { class: "spread" }, h("strong", {}, `Unplaced games (${trayGames.length})`), h("span", { class: "small muted" }, "Drag a game onto the grid, or drag one here to unschedule it.")),
+      h("div", { class: "tray-games" }, trayGames.map(g => gameCard(g, g => editGame(ctx, g), dnd)))) : null;
+    if (tray) dnd.tray(tray);
     holder.replaceChildren(h("div", { class: "card" },
       h("div", { class: "spread" }, h("h2", {}, "Schedule"), h("div", { class: "row" }, hardN ? h("span", { class: "pill bad" }, `${hardN} hard conflicts`) : games.length ? h("span", { class: "pill ok" }, "Conflict-free") : null, unsched.length ? h("span", { class: "pill bad" }, `${unsched.length} unplaced`) : null)),
-      controls, h("p", { class: "small muted" }, "Click a game to enter scores or move it. Red cards break a hard rule, amber cards miss a soft preference."),
-      games.length ? scheduleGrid(shown, data, st.day, st.venue, g => editGame(ctx, g)) : h("p", { class: "muted" }, "Generate a schedule to see it here."),
-      unsched.length ? h("div", {}, h("h3", {}, "Unplaced games"), h("div", { class: "grid g3" }, unsched.map(g => gameCard(g, g => isAdmin && editGame(ctx, g))))) : null));
+      controls, h("p", { class: "small muted" }, isAdmin
+        ? "Drag a game to move it: while you drag, green cells are clear, amber miss a preference and red break a rule (hover for why). Games of the same teams and coaches are outlined. Moved games are locked. Click a game to enter scores or change it."
+        : "Click a game to enter scores. Red cards break a hard rule, amber cards miss a soft preference."),
+      tray,
+      games.length ? scheduleGrid(shown, data, st.day, st.venue, g => editGame(ctx, g), dnd) : h("p", { class: "muted" }, "Generate a schedule to see it here."),
+      !isAdmin && unsched.length ? h("div", {}, h("h3", {}, "Unplaced games"), h("div", { class: "grid g3" }, unsched.map(g => gameCard(g, null)))) : null));
+    highlight();
   }
   ctx.refresh = refresh;
   body.replaceChildren(
     isAdmin ? h("div", { class: "card" }, h("div", { class: "spread" },
       h("div", {}, h("h2", {}, "Build the schedule"), h("p", { class: "muted small" }, `${data.teams.length} teams across ${data.divisions.length} divisions and ${data.courts.length} courts. The optimizer enforces rest, travel and multi-team-coach rules as hard limits, keeps divisions at their home venue, and leaves catch-up slots open.`)),
-      h("div", { class: "row" }, limit, gen, repair))) : null,
+      h("div", { class: "row" }, limit, gen, reopt, repair))) : null,
     result, holder);
+  await refresh();
+}
+
+function bracketTree(b, onClick) {
+  const rounds = [];
+  for (let r = 1; r <= b.rounds; r++) rounds.push(b.games.filter(g => g.round === r && g.name !== "3rd place"));
+  const third = b.games.find(g => g.name === "3rd place");
+  const side = (g, s) => {
+    const name = g[`team_${s}_name`], label = g[`label_${s}`], score = g[`score_${s}`];
+    const other = g[`score_${s === "a" ? "b" : "a"}`];
+    const win = g.status === "final" && score !== null && other !== null && score > other;
+    return h("div", { class: "side" + (name ? "" : " tbd") + (win ? " win" : "") }, h("span", {}, name || label, name && label.startsWith("Seed") ? h("span", { class: "muted small" }, ` (${label.replace("Seed ", "#")})`) : null), h("span", {}, score ?? ""));
+  };
+  const box = g => h("div", { class: "bgame" + (g.status === "final" ? " done" : ""), onclick: () => onClick && g.id && onClick(g) },
+    h("div", { class: "small muted spread" }, h("span", {}, g.name), h("span", {}, g.start_at ? fmtWhen(g.start_at) : "Not placed")),
+    side(g, "a"), side(g, "b"), g.venue ? h("div", { class: "small muted" }, `${g.venue} · ${g.court}`) : null);
+  return h("div", { class: "bracket-wrap" }, h("div", { class: "bracket" }, rounds.map(gs => h("div", { class: "bround" }, gs.map(box)))),
+    third ? h("div", { class: "third" }, box(third)) : null);
+}
+
+const BSTATUS = { waiting: ["", "Waiting for pool play"], ready: ["ok", "Seeded from standings"], tie: ["bad", "Tie: pick seeds"], manual: ["info", "Seeds set by hand"] };
+
+async function tabBrackets(ctx) {
+  const { data, tid, body, isAdmin } = ctx;
+  const holder = h("div", {});
+  const teamName = Object.fromEntries(data.teams.map(t => [t.id, t.name]));
+  const divTeams = id => data.teams.filter(t => t.division_id === id);
+  const form = h("form", { class: "fields" },
+    field("Division", sel("division_id", data.divisions.map(d => [d.id, `${d.name} (${divTeams(d.id).length} teams)`]))),
+    field("Name", inp("name", { value: "Championship", required: true, maxlength: 60 })),
+    field("Teams in bracket", sel("size", [2, 3, 4, 5, 6, 8, 10, 12, 16].map(n => [n, `${n} teams`]), 4)),
+    field("Seeding", sel("seeding", [["pool", "By pool finish (1st in A, 1st in B, ...)"], ["division", "By record across the division"]], "pool")),
+    h("div", { class: "field" }, h("label", {}, "Extra game"), h("label", { class: "row check" }, inp("third_place", { type: "checkbox" }), " 3rd-place game")),
+    h("div", { class: "field" }, h("label", {}, " "), h("button", { class: "primary", type: "submit" }, "Add bracket")));
+  form.onsubmit = async e => {
+    e.preventDefault(); const b = formData(form); b.division_id = Number(b.division_id); b.size = Number(b.size);
+    const r = await act(form.querySelector("button"), () => api(`/api/t/${tid}/brackets`, { body: b }));
+    if (r) { toast(r.placed ? `Bracket added; ${r.placed.unplaced.length ? `${r.placed.unplaced.length} games still need a slot` : "its games were placed after pool play"}.` : "Bracket added. Generate the schedule to place its games."); refresh(); }
+  };
+  function editSeeds(b) {
+    const teams = divTeams(b.division_id);
+    const picks = b.seed_list.map(s => sel("t", [["", "—"], ...teams.map(t => [t.id, t.name])], s.team_id || ""));
+    const f = h("form", { class: "stack" }, h("p", { class: "small muted" }, "Seeds you set here replace automatic seeding for this bracket."),
+      ...picks.map((p, i) => field(`Seed ${i + 1}`, p)), h("div", { class: "row end" }, h("button", { class: "primary", type: "submit" }, "Save seeds")));
+    let close;
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const ids = picks.map(p => Number(p.value));
+      if (await act(f.querySelector("button"), () => api(`/api/brackets/${b.id}/seeds`, { method: "PUT", body: { team_ids: ids } }), "Seeds saved")) { close(); refresh(); }
+    };
+    close = modal(`${b.division} · ${b.name} seeds`, f);
+  }
+  async function refresh() {
+    const [{ brackets }, { games }] = await Promise.all([api(`/api/t/${tid}/brackets`), api(`/api/t/${tid}/games`)]);
+    const gmap = Object.fromEntries(games.map(g => [g.id, g]));
+    holder.replaceChildren(
+      brackets.length ? null : h("div", { class: "card" }, h("p", { class: "muted" }, "No brackets yet. Add one below: its games are scheduled after pool play, the seeds fill in from the pool standings, and winners advance automatically as scores come in.")),
+      ...brackets.map(b => {
+        const [cls, label] = BSTATUS[b.status] || ["", b.status];
+        return h("div", { class: "card" },
+          h("div", { class: "spread" }, h("div", {}, h("h2", {}, `${b.division} · ${b.name}`), h("div", { class: "small muted" }, `${b.size} teams · ${b.seeding === "pool" ? "seeded by pool finish" : "seeded by division record"}${b.third_place ? " · 3rd-place game" : ""}`)),
+            h("div", { class: "row" }, h("span", { class: `pill ${cls}` }, label),
+              isAdmin ? h("button", { onclick: () => editSeeds(b) }, "Set seeds") : null,
+              isAdmin && b.manual_seeds ? h("button", { onclick: async e => { if (await act(e.target, () => api(`/api/brackets/${b.id}/seeds`, { method: "PUT", body: { team_ids: null } }), "Back to automatic seeding")) refresh(); } }, "Use automatic seeds") : null,
+              isAdmin ? h("button", { class: "danger", onclick: async e => { if (confirm(`Delete ${b.name} and its games?`) && await act(e.target, () => api(`/api/brackets/${b.id}`, { method: "DELETE" }), "Deleted")) refresh(); } }, "Delete") : null)),
+          b.note && b.status !== "manual" ? h("div", { class: `issue ${b.status === "tie" ? "hard" : "soft"} small` }, b.note) : null,
+          bracketTree(b, g => gmap[g.id] && editGame(ctx, gmap[g.id])),
+          h("details", {}, h("summary", { class: "small" }, "Seeds"), h("ol", { class: "small" }, b.seed_list.map(s => h("li", {}, s.team || h("span", { class: "muted" }, "TBD"))))));
+      }),
+      isAdmin ? h("div", { class: "card" }, h("h2", {}, "Add a bracket"), h("p", { class: "small muted" }, "Single elimination. When the field isn't a power of two, the top seeds get byes. Add several (Gold, Silver) to give every team more games."), form) : null);
+  }
+  ctx.refresh = refresh;
+  body.replaceChildren(holder);
   await refresh();
 }
 
@@ -649,7 +850,7 @@ async function viewTeam(teamId, tab) {
           const moved = g.original_start_at && g.start_at !== g.original_start_at;
           return h("div", { class: "list-game" },
             h("div", { class: "when" }, fmtWhen(g.start_at), moved ? h("div", { class: "pill warn" }, `moved from ${fmtTime(g.original_start_at)}`) : null),
-            h("div", {}, h("div", { class: "vs" }, "vs ", opp), h("div", { class: "muted small" }, `${g.venue || "TBD"} · ${g.court || ""} · Pool ${g.pool}`)),
+            h("div", {}, h("div", { class: "vs" }, "vs ", opp), h("div", { class: "muted small" }, `${g.venue || "TBD"} · ${g.court || ""} · ${gameTag(g)}`)),
             g.status === "final" ? h("span", { class: "pill ok" }, `Final ${g.team_a === team.id ? g.score_a + "-" + g.score_b : g.score_b + "-" + g.score_a}`) : g.status === "in_progress" ? h("span", { class: "pill info" }, "Live") : h("span", { class: "pill" }, "Scheduled"));
         })));
   } else if (tab === "prefs") {
@@ -666,8 +867,10 @@ async function viewTeam(teamId, tab) {
     sDiv.onchange = draw; draw();
     body.replaceChildren(h("div", { class: "card" }, h("div", { class: "spread" }, h("h2", {}, "Full schedule"), sDiv), list));
   } else if (tab === "standings") {
-    const { standings } = await api(`/api/t/${tid}/standings`);
-    body.replaceChildren(h("div", { class: "card" }, h("h2", {}, "Pool standings"), h("p", { class: "small muted" }, "Ranked by wins, then head-to-head, then point differential."), standingsView(standings, div.name, team.id)));
+    const [{ standings }, { brackets }] = await Promise.all([api(`/api/t/${tid}/standings`), api(`/api/t/${tid}/brackets`)]);
+    const mineB = brackets.filter(b => b.division_id === div.id);
+    body.replaceChildren(h("div", { class: "card" }, h("h2", {}, "Pool standings"), h("p", { class: "small muted" }, "Ranked by wins, then head-to-head, then point differential."), standingsView(standings, div.name, team.id)),
+      ...mineB.map(b => h("div", { class: "card" }, h("h2", {}, b.name), b.note ? h("p", { class: "small muted" }, b.note) : null, bracketTree(b))));
   } else {
     body.replaceChildren(h("div", { class: "card" }, h("h2", {}, "Updates"), notes.notifications.length ? notes.notifications.map(n => h("div", { class: "list-game" }, h("div", { class: "small muted" }, n.created_at + " UTC"), h("div", {}, n.message), h("span", {}))) : h("p", { class: "muted" }, "No updates yet.")));
   }
@@ -748,7 +951,8 @@ async function viewPublic(slug) {
       h("div", { class: "hero" }, h("h1", {}, d.tournament.name), h("div", { class: "muted" }, `${fmtDay(d.tournament.start_date)} – ${fmtDay(d.tournament.end_date)} · Live schedule, updates automatically`)),
       d.announcements.length ? h("div", { class: "card" }, h("h2", {}, "Announcements"), d.announcements.map(a => h("div", { class: "issue soft" }, a.message))) : null,
       h("div", { class: "row" }, q, ds), list,
-      h("div", { class: "card" }, h("h2", {}, "Pool standings"), standingsView(d.standings, st.division ? (divs.find(([id]) => String(id) === st.division) || [])[1] : "")));
+      h("div", { class: "card" }, h("h2", {}, "Pool standings"), standingsView(d.standings, st.division ? (divs.find(([id]) => String(id) === st.division) || [])[1] : "")),
+      ...(d.brackets || []).filter(b => !st.division || String(b.division_id) === st.division).map(b => h("div", { class: "card" }, h("h2", {}, `${b.division} · ${b.name}`), bracketTree(b))));
   }
   mount(holder);
   await load();

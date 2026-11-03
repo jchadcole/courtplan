@@ -42,6 +42,8 @@ Run tests with `python -m pytest -q`.
 | Balanced pools (RPI) | optional team rating seeds snake-drafted pools; same-club teams split across pools |
 | Standings and tie-breakers | wins, head-to-head (two-way), point differential, points allowed |
 | Bulk data entry | CSV import: `division,team,club,coach_name,coach_email,rating` |
+| Pool-to-bracket advancement | Brackets tab: single-elimination brackets (byes to top seeds, optional 3rd-place game) seeded by pool finish or division record. Bracket games are scheduled after pool play with rest built in, seeds fill when pool play ends, winners advance as scores come in, and an unbreakable tie alerts the director to pick seeds |
+| Hands-on schedule editing | Schedule tab: drag games between courts and times, or to and from the unplaced tray. While dragging, cells shade green, amber or red with the reason, and the same teams' and coach's games are outlined. Dragged games lock; "Re-optimize unlocked" re-plans around them. A rule can be waived for one game (for example a back-to-back on purpose) |
 
 ## Architecture
 
@@ -50,6 +52,7 @@ Run tests with `python -m pytest -q`.
   simulated annealing to cut soft costs (venue bouncing, off-home-venue games, missed preferences,
   long idle gaps, catch-up slots used). Hard rules are never relaxed. `validate()` re-checks any
   schedule on real times, so it also catches problems introduced by delays or manual moves.
+* `app/brackets.py`: bracket structure, seeding from standings, tie detection and advancement.
 * `app/ai.py`: Claude helpers (preference parsing with structured output, director briefing) with
   deterministic fallbacks.
 * `app/main.py`: FastAPI JSON API, SSE streams, public endpoints and static UI.
@@ -57,9 +60,10 @@ Run tests with `python -m pytest -q`.
   tokens on every write, login throttling, role checks (platform admin, tournament admin, site
   director, team manager). Team managers only see their own teams' preferences.
 * `static/`: dependency-free single-page UI with a strict Content-Security-Policy.
-* SQLite storage; every tournament's data is isolated by `tournament_id`.
+* SQLite storage; every tournament's data is isolated by `tournament_id`. Databases from v1 are migrated
+  in place on startup (bracket games can have undecided teams).
 
 ## Not built yet
 
-Pool-to-bracket advancement, SMS delivery (e.g. Twilio) for alerts, registration/payments,
+Double elimination and consolation brackets, touch drag and drop on phones, SMS delivery (e.g. Twilio) for alerts, registration/payments,
 historical RPI import across circuit stops, and multi-instance deployment (SSE is in-process).
